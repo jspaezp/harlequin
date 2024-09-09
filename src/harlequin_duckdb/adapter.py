@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 import json
 from pathlib import Path
 from typing import Any, Sequence
@@ -330,15 +331,18 @@ class DuckDbAdapter(HarlequinAdapter):
         }
 
         try:
-            connection = duckdb.connect(
-                database=f"{primary_db}{token}{saas}",
-                read_only=self.read_only,
-                config=config,
-            )
-            for db in other_dbs:
-                connection.execute(
-                    f"attach '{db}'{' (READ_ONLY)' if self.read_only else ''}"
+            if is_parquet_file(Path(primary_db)):
+                connection = build_parquet_views(self.conn_str)
+            else:
+                connection = duckdb.connect(
+                    database=f"{primary_db}{token}{saas}",
+                    read_only=self.read_only,
+                    config=config,
                 )
+                for db in other_dbs:
+                    connection.execute(
+                        f"attach '{db}'{' (READ_ONLY)' if self.read_only else ''}"
+                    )
         except (duckdb.CatalogException, duckdb.IOException) as e:
             if "sqlite_scanner" in (msg := str(e)):
                 msg = (
@@ -452,3 +456,42 @@ class DuckDbAdapter(HarlequinAdapter):
             return cls._rewrite_dot_open(command)
         else:
             return ""
+
+
+def is_parquet_file(path: Path) -> bool:
+    """
+    Returns True if the file is a parquet file.
+
+    The first 4 bytes of a parquet file (and the last 4) are a preseved
+    key 'PAR1'.
+    """
+    if not path.exists():
+        return False
+
+    fsize = path.stat().st_size
+    if fsize < 4:
+        return False
+    with open(path, "rb") as f:
+        head = f.read(4) == b"PAR1"
+        f.seek(-4, 2)
+        tail = f.read(4) == b"PAR1"
+        return head and tail
+
+
+def build_parquet_views(paths: Sequence[Path]) -> DuckDbConnection:
+    conn = duckdb.connect(database=IN_MEMORY_CONN_STR[0])
+    for i, path in enumerate(paths):
+        path = Path(path)
+        if not is_parquet_file(path):
+            raise RuntimeError(f"Path {path} is not a parquet file.")
+
+        # Is there any instance where a sql injection attack could happen here?
+        # ... since the only user is the user of the CLI ...
+        # table_name = f"table_{i}_" + re.sub(r"[^a-zA-Z0-9_]", "", path.stem)
+        table_name = f"table_{i}"
+        pqfile = str(path)
+        query = f"CREATE VIEW {table_name} AS SELECT * FROM read_parquet('{pqfile}')"
+        conn.execute(query)
+        # conn.sql(query)
+
+    return conn
